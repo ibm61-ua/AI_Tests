@@ -16,7 +16,7 @@ SUCCESS    = "#2e7d32"
 ERROR      = "#c62828"
 TEXT       = "#e8e8e8"
 SUBTEXT    = "#9e9e9e"
-GEMINI_BG  = "#1a1a2e"
+GROQ_BG  = "#1a1a2e"
 
 W, H = 1280, 720
 
@@ -195,7 +195,7 @@ class TestWindow(tk.Toplevel):
             command=self.on_close
         ).pack(side="right", padx=15, pady=10)
 
-        # Cuerpo dividido: izquierda (pregunta) | derecha (Gemini)
+        # Cuerpo dividido: izquierda (pregunta) | derecha (Groq)
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=0, pady=0)
 
@@ -228,32 +228,32 @@ class TestWindow(tk.Toplevel):
         # ── Separador vertical ────────────────────────────
         tk.Frame(body, bg="#2a2a2a", width=1).pack(side="left", fill="y")
 
-        # ── Panel derecho (Gemini) ────────────────────────
-        right = tk.Frame(body, bg=GEMINI_BG, width=480)
+        # ── Panel derecho (Groq) ────────────────────────
+        right = tk.Frame(body, bg=GROQ_BG, width=480)
         right.pack(side="right", fill="both")
         right.pack_propagate(False)
 
-        gem_header = tk.Frame(right, bg=GEMINI_BG)
+        gem_header = tk.Frame(right, bg=GROQ_BG)
         gem_header.pack(fill="x", padx=20, pady=(20, 10))
 
         tk.Label(
-            gem_header, text="✦ Groq AI  (Llama 3.3)", bg=GEMINI_BG, fg=ACCENT,
+            gem_header, text="✦ Groq AI  (Llama 3.3)", bg=GROQ_BG, fg=ACCENT,
             font=("Segoe UI", 13, "bold")
         ).pack(side="left")
 
-        self.gemini_status = tk.Label(
-            gem_header, text="", bg=GEMINI_BG, fg=SUBTEXT,
+        self.groq_status = tk.Label(
+            gem_header, text="", bg=GROQ_BG, fg=SUBTEXT,
             font=("Segoe UI", 9)
         )
-        self.gemini_status.pack(side="right")
+        self.groq_status.pack(side="right")
 
-        self.gemini_text = scrolledtext.ScrolledText(
-            right, wrap=tk.WORD, bg=GEMINI_BG, fg=TEXT,
+        self.groq_text = scrolledtext.ScrolledText(
+            right, wrap=tk.WORD, bg=GROQ_BG, fg=TEXT,
             font=("Segoe UI", 11), relief="flat",
             insertbackground=TEXT, state=tk.DISABLED,
             padx=16, pady=10
         )
-        self.gemini_text.pack(fill="both", expand=True, padx=10, pady=(0, 20))
+        self.groq_text.pack(fill="both", expand=True, padx=10, pady=(0, 20))
 
     # ── Cargar pregunta ──────────────────────────────────
     def load_question(self):
@@ -265,9 +265,9 @@ class TestWindow(tk.Toplevel):
         self.counter_label.config(text=f"Pregunta  {self.current_idx + 1}  /  {len(self.questions)}")
         self.q_label.config(text=q['question'])
 
-        # Limpiar panel Gemini
-        self._set_gemini_text("Responde la pregunta para ver el análisis de Gemini.")
-        self.gemini_status.config(text="")
+        # Limpiar panel Groq
+        self._set_groq_text("Responde la pregunta para ver el analisis de Groq.")
+        self.groq_status.config(text="")
 
         self.answer_buttons = []
         for i, ans in enumerate(q['answers']):
@@ -312,9 +312,9 @@ class TestWindow(tk.Toplevel):
             text="Finalizar" if is_last else "Siguiente →"
         )
 
-        # Llamar a Gemini en un hilo separado
-        self.gemini_status.config(text="⏳ consultando...")
-        self._set_gemini_text("")
+        # Llamar a Groq en un hilo separado
+        self.groq_status.config(text="⏳ consultando...")
+        self._set_groq_text("")
         threading.Thread(
             target=self._ask_groq,
             args=(q,),
@@ -347,17 +347,17 @@ class TestWindow(tk.Toplevel):
         except Exception as e:
             result_text = f"Error al contactar con Groq:\n{str(e)}"
 
-        self.after(0, lambda: self._on_gemini_response(result_text))
+        self.after(0, lambda: self._on_groq_response(result_text))
 
-    def _on_gemini_response(self, text):
-        self._set_gemini_text(text)
-        self.gemini_status.config(text="✦ listo")
+    def _on_groq_response(self, text):
+        self._set_groq_text(text)
+        self.groq_status.config(text="✦ listo")
 
-    def _set_gemini_text(self, text):
-        self.gemini_text.config(state=tk.NORMAL)
-        self.gemini_text.delete("1.0", tk.END)
-        self.gemini_text.insert(tk.END, text)
-        self.gemini_text.config(state=tk.DISABLED)
+    def _set_groq_text(self, text):
+        self.groq_text.config(state=tk.NORMAL)
+        self.groq_text.delete("1.0", tk.END)
+        self.groq_text.insert(tk.END, text)
+        self.groq_text.config(state=tk.DISABLED)
 
     # ── Siguiente pregunta ───────────────────────────────
     def next_question(self):
