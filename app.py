@@ -3,6 +3,7 @@ from tkinter import filedialog, messagebox
 import threading
 import random
 import os
+import textwrap
 from groq import Groq
 
 # ─────────────────────────────────────────────────────────
@@ -347,7 +348,7 @@ class TestWindow(ctk.CTkToplevel):
 
         self.q_label = ctk.CTkLabel(
             left, text="", font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
-            justify="left"
+            justify="left", wraplength=800
         )
         self.q_label.pack(fill="x", pady=(10, 30), anchor="nw")
         
@@ -415,12 +416,17 @@ class TestWindow(ctk.CTkToplevel):
 
         self.answer_buttons = []
         for i, ans in enumerate(q['answers']):
+            ans_text = f"{chr(65+i)}.  {ans}"
+            wrapped_text = textwrap.fill(ans_text, width=90)
+            lines = wrapped_text.count('\n') + 1
+            btn_height = max(50, lines * 25)
+
             btn = ctk.CTkButton(
                 self.buttons_frame,
-                text=f"{chr(65+i)}.  {ans}",
+                text=wrapped_text,
                 font=ctk.CTkFont(family="Segoe UI", size=15),
                 fg_color="#2a2a2a", hover_color="#3a3a3a", text_color=TEXT,
-                anchor="w", height=50,
+                anchor="w", height=btn_height,
                 command=lambda idx=i: self.check_answer(idx)
             )
             btn.pack(fill="x", pady=6)
