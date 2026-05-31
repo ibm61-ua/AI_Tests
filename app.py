@@ -1,10 +1,14 @@
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
+import tkinter as tk
 import threading
 import random
 import os
-import textwrap
-from groq import Groq
+import re
+import io
+import urllib.request
+from groq import Groq, RateLimitError
+from PIL import Image, ImageTk
 
 # ─────────────────────────────────────────────────────────
 # Configuración inicial
@@ -24,6 +28,303 @@ GROQ_BG = "#1a1a2e"
 
 W, H = 1280, 720
 
+
+# ─────────────────────────────────────────────────────────
+# Markdown renderer para widgets Text de tkinter
+# ─────────────────────────────────────────────────────────
+def apply_markdown_tags(text_widget, font_size=15):
+    """Configura los tags de Markdown sobre un widget tk.Text."""
+    bold_font   = ("Segoe UI", font_size, "bold")
+    italic_font = ("Segoe UI", font_size, "italic")
+    bi_font     = ("Segoe UI", font_size, "bold italic")
+    h1_font     = ("Segoe UI", font_size + 8, "bold")
+    h2_font     = ("Segoe UI", font_size + 4, "bold")
+    h3_font     = ("Segoe UI", font_size + 2, "bold")
+    code_font   = ("Consolas", font_size)
+    code_bg     = "#1e1e2e"
+    code_fg     = "#a6e3a1"
+
+    text_widget.tag_configure("h1",     font=h1_font,   foreground=TEXT)
+    text_widget.tag_configure("h2",     font=h2_font,   foreground=TEXT)
+    text_widget.tag_configure("h3",     font=h3_font,   foreground=TEXT)
+    text_widget.tag_configure("bold",   font=bold_font,  foreground=TEXT)
+    text_widget.tag_configure("italic", font=italic_font, foreground=TEXT)
+    text_widget.tag_configure("bi",     font=bi_font,   foreground=TEXT)
+    text_widget.tag_configure("code",   font=code_font,  background=code_bg, foreground=code_fg)
+    text_widget.tag_configure("codeblock", font=code_font, background=code_bg,
+                              foreground=code_fg, lmargin1=10, lmargin2=10, spacing1=4, spacing3=4)
+    text_widget.tag_configure("normal", font=("Segoe UI", font_size), foreground=TEXT)
+
+
+def render_markdown(text_widget, raw_text):
+    """
+    Inserta 'raw_text' en un widget tk.Text con formato Markdown básico.
+    Soporta: # h1/h2/h3, **bold**, *italic*, ***bold italic***, `code`, bloques ```code```.
+    Requiere haber llamado antes a apply_markdown_tags().
+    """
+    text_widget.configure(state="normal")
+    text_widget.delete("1.0", "end")
+
+    # Separar primero los bloques de código ``` ... ```
+    segments = re.split(r'(```[\s\S]*?```)', raw_text)
+
+    for seg in segments:
+        if seg.startswith('```') and seg.endswith('```'):
+            # Bloque de código
+            inner = seg[3:-3].lstrip('\n')
+            # Eliminar posible lenguaje en la primera línea (```python ...)
+            inner = re.sub(r'^[a-zA-Z]*\n', '', inner)
+            text_widget.insert("end", inner + "\n", "codeblock")
+        else:
+            # Procesar línea a línea para encabezados
+            lines = seg.split('\n')
+            for li, line in enumerate(lines):
+                if li > 0:
+                    text_widget.insert("end", "\n")
+
+                h_match = re.match(r'^(#{1,3})\s+(.*)', line)
+                if h_match:
+                    level = len(h_match.group(1))
+                    content = h_match.group(2)
+                    tag = f"h{level}"
+                    _insert_inline(text_widget, content, base_tag=tag)
+                else:
+                    _insert_inline(text_widget, line, base_tag="normal")
+
+    text_widget.configure(state="disabled")
+
+
+_INLINE_RE = re.compile(
+    r'(\*\*\*(.+?)\*\*\*)'   # bold+italic
+    r'|(\*\*(.+?)\*\*)'       # bold
+    r'|(\*(.+?)\*)'           # italic
+    r'|(__(.+?)__)'           # bold (alt)
+    r'|(_(.+?)_)'             # italic (alt)
+    r'|(`(.+?)`)',             # inline code
+    re.DOTALL
+)
+
+
+def _resolve_inline_tag(match, base_tag):
+    """Devuelve (text, tag) para un match de _INLINE_RE."""
+    if match.group(1):   return match.group(2), "bi"
+    if match.group(3):   return match.group(4), "bold"
+    if match.group(5):   return match.group(6), "italic"
+    if match.group(7):   return match.group(8), "bold"
+    if match.group(9):   return match.group(10), "italic"
+    if match.group(11):  return match.group(12), "code"
+    return match.group(0), base_tag
+
+
+def _insert_inline(text_widget, line, base_tag="normal"):
+    """Inserta una línea de texto procesando los tokens inline de Markdown."""
+    last = 0
+    for m in _INLINE_RE.finditer(line):
+        start, end = m.span()
+        if start > last:
+            text_widget.insert("end", line[last:start], base_tag)
+        content, tag = _resolve_inline_tag(m, base_tag)
+        text_widget.insert("end", content, tag)
+        last = end
+    if last < len(line):
+        text_widget.insert("end", line[last:], base_tag)
+
+
+# URL de imagen en markdown: soporta http/https, termina en png/jpg/jpeg/gif/webp
+_IMG_URL_RE = re.compile(
+    r'https?://\S+\.(?:png|jpg|jpeg|gif|webp)(?:[^\s\)\]]*)?',
+    re.IGNORECASE
+)
+
+
+# ─────────────────────────────────────────────────────────
+# Widget: pregunta con Markdown + soporte de imagen
+# ─────────────────────────────────────────────────────────
+class MarkdownTextbox(ctk.CTkFrame):
+    """CTkFrame con un tk.Text para texto Markdown y una imagen opcional debajo.
+    Usa grid internamente: fila 0 = texto (se expande), fila 1 = imagen (fija).
+    """
+    _BG_RGB = tuple(int(BG.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+
+    def __init__(self, master, font_size=22, fg_color="transparent", **kw):
+        super().__init__(master, fg_color=fg_color, **kw)
+        self._font_size = font_size
+        self._img_ref   = None
+
+        # Grid: fila 0 = texto (peso 1), fila 1 = imagen (peso 0)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=0)
+        self.grid_columnconfigure(0, weight=1)
+
+        self._txt = tk.Text(
+            self, wrap="word", bd=0, highlightthickness=0,
+            background=BG, foreground=TEXT,
+            insertbackground=BG, selectbackground=ACCENT,
+            font=("Segoe UI", font_size),
+            cursor="arrow",
+            spacing1=4, spacing3=2,
+        )
+        self._txt.grid(row=0, column=0, sticky="nsew")
+        apply_markdown_tags(self._txt, font_size)
+        self._txt.configure(state="disabled")
+
+        # Fila 1: contenedor de imagen (no visible hasta que haya una)
+        self._img_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self._img_label = tk.Label(self._img_frame, bg=BG, cursor="arrow")
+        self._img_label.pack()
+        self._loading_label = ctk.CTkLabel(
+            self._img_frame,
+            text="⏳ Cargando imagen...",
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+            text_color="gray"
+        )
+
+    def set_markdown(self, text):
+        # Detectar y extraer URLs de imagen del texto
+        img_urls = _IMG_URL_RE.findall(text)
+        clean_text = _IMG_URL_RE.sub('', text).strip()
+
+        render_markdown(self._txt, clean_text)
+
+        # Ocultar imagen anterior
+        self._img_frame.grid_forget()
+        self._loading_label.pack_forget()
+        self._img_label.configure(image='')
+        self._img_ref = None
+
+        if img_urls:
+            self._img_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            self._loading_label.pack(pady=4)
+            threading.Thread(
+                target=self._load_image,
+                args=(img_urls[0],),
+                daemon=True
+            ).start()
+
+    def _load_image(self, url):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            img = Image.open(io.BytesIO(data))
+
+            # Componer canal alfa sobre el fondo oscuro para evitar imagen negra
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGBA")
+                background = Image.new("RGBA", img.size, self._BG_RGB + (255,))
+                background.paste(img, mask=img.split()[3])
+                img = background.convert("RGB")
+            else:
+                img = img.convert("RGB")
+
+            img.thumbnail((700, 320), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.after(0, lambda: self._show_image(photo))
+        except Exception as exc:
+            self.after(0, lambda: self._show_error(str(exc)))
+
+    def _show_image(self, photo):
+        self._img_ref = photo
+        self._loading_label.pack_forget()
+        self._img_label.configure(image=photo)
+        self._img_label.pack(pady=(4, 8))
+
+    def _show_error(self, msg):
+        self._loading_label.configure(text="⚠️ No se pudo cargar la imagen", text_color="#c62828")
+
+# ─────────────────────────────────────────────────────────
+# Widget: botón de respuesta con Markdown
+# ─────────────────────────────────────────────────────────
+class MarkdownButton(ctk.CTkFrame):
+    """Botón con texto Markdown. Simula hover y estados de color."""
+
+    # colores base
+    _NORMAL_BG  = "#2a2a2a"
+    _HOVER_BG   = "#3a3a3a"
+    _ACTIVE_BG  = None  # se fija en set_state()
+
+    def __init__(self, master, letter, answer_text, command, font_size=15, **kw):
+        super().__init__(master, fg_color=self._NORMAL_BG, corner_radius=8, **kw)
+        self._cmd      = command
+        self._enabled  = True
+        self._bg_color = self._NORMAL_BG
+        self._font_size = font_size
+
+        prefix = f"{letter}.  "
+
+        self._txt = tk.Text(
+            self, wrap="word", bd=0, highlightthickness=0,
+            background=self._NORMAL_BG, foreground=TEXT,
+            insertbackground=self._NORMAL_BG,
+            font=("Segoe UI", font_size),
+            cursor="hand2",
+            spacing1=3, spacing3=3,
+            padx=14, pady=12,
+            height=1,        # empieza en 1 línea; se autoajusta tras el primer Configure
+        )
+        self._txt.pack(fill="x")   # sin expand, así no fagocita el alto
+        apply_markdown_tags(self._txt, font_size)
+
+        # Insertar letra en bold y luego el contenido md
+        self._txt.configure(state="normal")
+        self._txt.insert("end", prefix, "bold")
+        _insert_inline(self._txt, answer_text, base_tag="normal")
+        self._txt.configure(state="disabled")
+
+        # Bind eventos
+        for w in (self, self._txt):
+            w.bind("<Enter>",   self._on_enter)
+            w.bind("<Leave>",   self._on_leave)
+            w.bind("<Button-1>", self._on_click)
+
+        # Auto-ajustar altura cuando el widget tenga un ancho válido
+        self._txt.bind("<Configure>", self._auto_height)
+
+    # --------------------------------------------------
+    def _auto_height(self, event=None):
+        """Reajusta la altura del Text al número real de líneas visuales."""
+        try:
+            lines = self._txt.count("1.0", "end", "displaylines")
+            if lines:
+                self._txt.configure(height=max(1, lines[0]))
+        except Exception:
+            pass
+
+    def _set_bg(self, color):
+        self._bg_color = color
+        self.configure(fg_color=color)
+        self._txt.configure(background=color)
+
+    def _on_enter(self, _=None):
+        if self._enabled:
+            self._set_bg(self._HOVER_BG)
+
+    def _on_leave(self, _=None):
+        if self._enabled:
+            self._set_bg(self._NORMAL_BG)
+
+    def _on_click(self, _=None):
+        if self._enabled and self._cmd:
+            self._cmd()
+
+    def set_state(self, color=None):
+        """
+        Deshabilita el botón y opcionalmente lo colorea.
+        color: None = gris apagado, SUCCESS = verde, ERROR = rojo.
+        """
+        self._enabled = False
+        self._txt.configure(cursor="arrow")
+        if color:
+            self._set_bg(color)
+            self._txt.configure(foreground="white")
+            for tag in ("bold", "italic", "bi", "h1", "h2", "h3", "normal", "code", "codeblock"):
+                self._txt.tag_configure(tag, foreground="white")
+        else:
+            self._set_bg("#222222")
+            self._txt.configure(foreground=SUBTEXT)
+            for tag in ("bold", "italic", "bi", "h1", "h2", "h3", "normal"):
+                self._txt.tag_configure(tag, foreground=SUBTEXT)
+
 def center_window(win, w, h):
     win.update_idletasks()
     x = (win.winfo_screenwidth() // 2) - (w // 2)
@@ -38,8 +339,9 @@ class App(ctk.CTk):
         super().__init__()
         self.title("Gestor de Preguntas Tipo Test")
         self.geometry(f"{W}x{H}")
+        self.minsize(1024, 600)
         center_window(self, W, H)
-        self.resizable(False, False)
+        self.resizable(True, True)
 
         self.questions = []
 
@@ -149,6 +451,10 @@ class App(ctk.CTk):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read().strip().replace('\r\n', '\n')
+
+            # Convertir \n literal (dos chars: \ + n) a salto de línea real
+            # para soportar tablas y texto multilínea compactado en una sola línea
+            content = content.replace('\\n', '\n')
 
             blocks = content.split('\n\n')
             for block in blocks:
@@ -280,12 +586,22 @@ class TestWindow(ctk.CTkToplevel):
         super().__init__(master)
         self.title("Realizando Test")
         self.geometry(f"{W}x{H}")
+        self.minsize(1024, 600)
         center_window(self, W, H)
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.questions   = list(questions)  
-        random.shuffle(self.questions)       
+        # Deduplicar por texto de pregunta (preserva el primero encontrado)
+        seen = set()
+        unique = []
+        for q in questions:
+            key = q['question'].strip().lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(q)
+        self.questions = unique
+        random.shuffle(self.questions)
+
         self.current_idx = 0
         self.api_key     = api_key
         self.answered    = False
@@ -293,6 +609,19 @@ class TestWindow(ctk.CTkToplevel):
         
         self.correct_count = 0
         self.incorrect_count = 0
+        
+        self.prompt_template = (
+            "Actúa como un profesor experto y explica la siguiente pregunta de tipo test.\n\n"
+            "PREGUNTA:\n\"{question}\"\n\n"
+            "OPCIONES:\n{opciones}\n\n"
+            "Tu tarea es explicar la respuesta de forma clara y concisa usando EXACTAMENTE el siguiente formato (no añadas saludos, ni introducciones, ni repitas 'La respuesta correcta es...'):\n\n"
+            "✅ RESPUESTA CORRECTA\n"
+            "[Indica solo la letra y el concepto de la respuesta correcta de forma directa]\n\n"
+            "📖 CONTEXTO\n"
+            "[Explica el porqué de la respuesta correcta y el concepto teórico subyacente de forma educativa]\n\n"
+            "❌ OPCIONES INCORRECTAS\n"
+            "[Explica brevemente por qué las otras opciones no son válidas, usando viñetas para cada una]"
+        )
 
         self._build_ui()
         self.load_question()
@@ -342,25 +671,11 @@ class TestWindow(ctk.CTkToplevel):
         self.body.grid_columnconfigure(2, weight=self.right_weight, uniform="a")
         self.body.grid_rowconfigure(0, weight=1)
 
-        # Panel izquierdo
+        # Panel izquierdo — layout: next_button y buttons anclados abajo, q_box rellena el resto
         left = ctk.CTkFrame(self.body, fg_color="transparent")
         left.grid(row=0, column=0, sticky="nsew", padx=40, pady=30)
 
-        self.q_label = ctk.CTkLabel(
-            left, text="", font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"),
-            justify="left", wraplength=800
-        )
-        self.q_label.pack(fill="x", pady=(10, 30), anchor="nw")
-        
-        def _update_wrap(event):
-            # Dejamos un pequeño margen para que no toque los bordes exactamente
-            wrap = max(200, event.width - 20)
-            self.q_label.configure(wraplength=wrap)
-        left.bind("<Configure>", _update_wrap)
-
-        self.buttons_frame = ctk.CTkFrame(left, fg_color="transparent")
-        self.buttons_frame.pack(fill="x")
-
+        # Botón siguiente — se empaqueta PRIMERO con side=bottom (queda abajo del todo)
         self.next_button = ctk.CTkButton(
             left, text="Siguiente →", command=self.next_question,
             font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
@@ -368,6 +683,14 @@ class TestWindow(ctk.CTkToplevel):
             state="disabled"
         )
         self.next_button.pack(side="bottom", anchor="e", pady=10)
+
+        # Respuestas — justo encima del botón siguiente
+        self.buttons_frame = ctk.CTkFrame(left, fg_color="transparent")
+        self.buttons_frame.pack(side="bottom", fill="x", pady=(0, 6))
+
+        # Pregunta — ocupa el espacio restante en la parte superior
+        self.q_box = MarkdownTextbox(left, font_size=22, fg_color="transparent")
+        self.q_box.pack(fill="both", expand=True, pady=(10, 12))
 
         # Separador
         ctk.CTkFrame(self.body, width=2, fg_color="#2a2a2a").grid(row=0, column=1, sticky="ns")
@@ -384,6 +707,12 @@ class TestWindow(ctk.CTkToplevel):
             font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold")
         ).pack(side="left")
 
+        prompt_btn = ctk.CTkButton(
+            gem_header, text="⚙️ Prompt", width=30, height=30,
+            command=self._edit_prompt, fg_color="#333", hover_color="#444"
+        )
+        prompt_btn.pack(side="right", padx=(10, 0))
+
         self.groq_status = ctk.CTkLabel(
             gem_header, text="", font=ctk.CTkFont(family="Segoe UI", size=12), text_color="gray"
         )
@@ -393,7 +722,16 @@ class TestWindow(ctk.CTkToplevel):
             right, font=ctk.CTkFont(family="Segoe UI", size=17),
             fg_color="transparent", text_color=TEXT, wrap="word"
         )
-        self.groq_text.pack(fill="both", expand=True, padx=15, pady=(0, 20))
+        self.groq_text.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        self.groq_button = ctk.CTkButton(
+            right, text="✨ Consultar respuesta con Groq",
+            command=self._on_groq_button_click,
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            fg_color="#4f8ef7", hover_color="#3a70d4",
+            height=40, state="disabled"
+        )
+        self.groq_button.pack(fill="x", padx=20, pady=(0, 20))
 
     def load_question(self):
         if hasattr(self, 'left_weight') and self.left_weight != 70:
@@ -409,25 +747,20 @@ class TestWindow(ctk.CTkToplevel):
         prog_val = (self.current_idx) / len(self.questions)
         self.progress.set(prog_val)
         self.counter_label.configure(text=f"Pregunta  {self.current_idx + 1} / {len(self.questions)}")
-        self.q_label.configure(text=q['question'])
+        self.q_box.set_markdown(q['question'])
 
-        self._set_groq_text("Responde la pregunta para ver el análisis de Groq.")
+        self._set_groq_text("Responde la pregunta y luego presiona \"Consultar con Groq\" para ver el análisis.")
         self.groq_status.configure(text="")
+        self.groq_button.configure(state="disabled")
 
         self.answer_buttons = []
         for i, ans in enumerate(q['answers']):
-            ans_text = f"{chr(65+i)}.  {ans}"
-            wrapped_text = textwrap.fill(ans_text, width=90)
-            lines = wrapped_text.count('\n') + 1
-            btn_height = max(50, lines * 25)
-
-            btn = ctk.CTkButton(
+            btn = MarkdownButton(
                 self.buttons_frame,
-                text=wrapped_text,
-                font=ctk.CTkFont(family="Segoe UI", size=15),
-                fg_color="#2a2a2a", hover_color="#3a3a3a", text_color=TEXT,
-                anchor="w", height=btn_height,
-                command=lambda idx=i: self.check_answer(idx)
+                letter=chr(65 + i),
+                answer_text=ans,
+                command=lambda idx=i: self.check_answer(idx),
+                font_size=15,
             )
             btn.pack(fill="x", pady=6)
             self.answer_buttons.append(btn)
@@ -457,11 +790,11 @@ class TestWindow(ctk.CTkToplevel):
 
         for i, btn in enumerate(self.answer_buttons):
             if i == correct_idx:
-                btn.configure(fg_color=SUCCESS, hover_color=SUCCESS, text_color="white", state="disabled")
+                btn.set_state(color=SUCCESS)
             elif i == selected_idx:
-                btn.configure(fg_color=ERROR, hover_color=ERROR, text_color="white", state="disabled")
+                btn.set_state(color=ERROR)
             else:
-                btn.configure(state="disabled")
+                btn.set_state(color=None)
 
         is_last = self.current_idx >= len(self.questions) - 1
         self.next_button.configure(
@@ -469,13 +802,16 @@ class TestWindow(ctk.CTkToplevel):
             text="Finalizar" if is_last else "Siguiente →"
         )
 
+        self.groq_button.configure(state="normal")
+        self.groq_status.configure(text="Listo para consultar")
+        self._set_groq_text("Presiona \"Consultar con Groq\" para obtener el análisis de la IA.")
+
+    def _on_groq_button_click(self):
+        self.groq_button.configure(state="disabled")
         self.groq_status.configure(text="⏳ consultando...")
         self._set_groq_text("")
-        threading.Thread(
-            target=self._ask_groq,
-            args=(q,),
-            daemon=True
-        ).start()
+        q = self.questions[self.current_idx]
+        threading.Thread(target=self._ask_groq, args=(q,), daemon=True).start()
 
     def _ask_groq(self, q):
         try:
@@ -485,18 +821,13 @@ class TestWindow(ctk.CTkToplevel):
                 [f"  {chr(65+i)}. {ans}" + (" (CORRECTA)" if i == q['correct_index'] else "")
                  for i, ans in enumerate(q['answers'])]
             )
-            prompt = (
-                "Actúa como un profesor experto y explica la siguiente pregunta de tipo test.\n\n"
-                f"PREGUNTA:\n\"{q['question']}\"\n\n"
-                f"OPCIONES:\n{opciones}\n\n"
-                "Tu tarea es explicar la respuesta de forma clara y concisa usando EXACTAMENTE el siguiente formato (no añadas saludos, ni introducciones, ni repitas 'La respuesta correcta es...'):\n\n"
-                "✅ RESPUESTA CORRECTA\n"
-                "[Indica solo la letra y el concepto de la respuesta correcta de forma directa]\n\n"
-                "📖 CONTEXTO\n"
-                "[Explica el porqué de la respuesta correcta y el concepto teórico subyacente de forma educativa]\n\n"
-                "❌ OPCIONES INCORRECTAS\n"
-                "[Explica brevemente por qué las otras opciones no son válidas, usando viñetas para cada una]"
-            )
+            try:
+                prompt = self.prompt_template.format(
+                    question=q['question'],
+                    opciones=opciones
+                )
+            except Exception:
+                prompt = self.prompt_template + f"\n\nPREGUNTA:\n{q['question']}\n\nOPCIONES:\n{opciones}"
 
             chat = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -504,11 +835,15 @@ class TestWindow(ctk.CTkToplevel):
                 max_tokens=512
             )
             result_text = chat.choices[0].message.content
+            result_text = result_text.replace('\\n', '\n')
+            self.after(0, lambda: self._on_groq_response(result_text))
+
+        except RateLimitError:
+            self.after(0, lambda: self._show_quota_dialog(q))
 
         except Exception as e:
             result_text = f"Error al contactar con Groq:\n{str(e)}"
-
-        self.after(0, lambda: self._on_groq_response(result_text))
+            self.after(0, lambda: self._on_groq_response(result_text))
 
     def _on_groq_response(self, text):
         self._set_groq_text(text)
@@ -519,6 +854,108 @@ class TestWindow(ctk.CTkToplevel):
         self.groq_text.delete("1.0", "end")
         self.groq_text.insert("end", text)
         self.groq_text.configure(state="disabled")
+
+    def _show_quota_dialog(self, q):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Límite de API alcanzado")
+        dialog.geometry("500x250")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        center_x = self.winfo_x() + (self.winfo_width() // 2) - 250
+        center_y = self.winfo_y() + (self.winfo_height() // 2) - 125
+        dialog.geometry(f"+{center_x}+{center_y}")
+
+        ctk.CTkLabel(
+            dialog,
+            text="⚠️ Has agotado los tokens de tu API key de Groq.",
+            font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+            text_color="#ff6b6b"
+        ).pack(pady=(25, 5))
+
+        ctk.CTkLabel(
+            dialog,
+            text="Introduce una nueva API key para continuar:",
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+            text_color="gray"
+        ).pack(pady=(0, 15))
+
+        key_var = ctk.StringVar()
+        entry = ctk.CTkEntry(
+            dialog, textvariable=key_var,
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+            width=380, height=40, show="•"
+        )
+        entry.pack(pady=(0, 20))
+        entry.focus_set()
+
+        def _cancel():
+            dialog.destroy()
+            self.groq_button.configure(state="normal")
+            self.groq_status.configure(text="Intenta de nuevo cuando tengas una nueva API key")
+
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack()
+
+        ctk.CTkButton(
+            btn_frame, text="Cancelar", width=120, height=35,
+            fg_color="#444", hover_color="#555",
+            command=_cancel
+        ).pack(side="left", padx=10)
+
+        def on_submit():
+            new_key = key_var.get().strip()
+            if not new_key:
+                messagebox.showwarning("API Key", "La API key no puede estar vacía.", parent=dialog)
+                return
+            self.api_key = new_key
+            dialog.destroy()
+            self.groq_status.configure(text="⏳ reintentando...")
+            self._set_groq_text("Reintentando con la nueva API key...")
+            threading.Thread(target=self._ask_groq, args=(q,), daemon=True).start()
+
+        ctk.CTkButton(
+            btn_frame, text="Cambiar API Key", width=160, height=35,
+            fg_color="#4f8ef7", hover_color="#3a70d4",
+            command=on_submit
+        ).pack(side="left", padx=10)
+
+    def _edit_prompt(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Personalizar Prompt")
+        dialog.geometry("700x500")
+        dialog.transient(self)
+        dialog.grab_set()
+        center_window(dialog, 700, 500)
+
+        ctk.CTkLabel(
+            dialog, text="Edita el prompt del sistema.\nUsa {question} y {opciones} donde quieras que se inserten los datos.",
+            font=ctk.CTkFont(family="Segoe UI", size=14), justify="left"
+        ).pack(pady=(20, 10), padx=20, anchor="w")
+
+        textbox = ctk.CTkTextbox(dialog, font=ctk.CTkFont(family="Segoe UI", size=13), wrap="word")
+        textbox.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        textbox.insert("1.0", self.prompt_template)
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=(0, 20))
+
+        def on_save():
+            self.prompt_template = textbox.get("1.0", "end-1c")
+            dialog.destroy()
+
+        ctk.CTkButton(
+            btn_frame, text="Cancelar", command=dialog.destroy,
+            fg_color="#444", hover_color="#555", width=120
+        ).pack(side="left", padx=10)
+
+        ctk.CTkButton(
+            btn_frame, text="Guardar", command=on_save,
+            fg_color="#4f8ef7", hover_color="#3a70d4", width=120
+        ).pack(side="left", padx=10)
 
     def next_question(self):
         if self.current_idx < len(self.questions) - 1:
