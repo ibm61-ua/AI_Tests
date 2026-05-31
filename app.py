@@ -598,7 +598,24 @@ class TestWindow(ctk.CTkToplevel):
             key = q['question'].strip().lower()
             if key not in seen:
                 seen.add(key)
-                unique.append(q)
+                
+                # Mezclar respuestas aleatoriamente
+                ans_list = list(enumerate(q['answers']))
+                random.shuffle(ans_list)
+                
+                new_answers = []
+                new_correct = 0
+                for new_idx, (old_idx, ans_text) in enumerate(ans_list):
+                    new_answers.append(ans_text)
+                    if old_idx == q['correct_index']:
+                        new_correct = new_idx
+                        
+                unique.append({
+                    'question': q['question'],
+                    'correct_index': new_correct,
+                    'answers': new_answers
+                })
+                
         self.questions = unique
         random.shuffle(self.questions)
 
